@@ -30,11 +30,28 @@ CREATE TABLE IF NOT EXISTS papers (
 """
 
 
+_JOB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS refresh_job (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    state TEXT NOT NULL,
+    message TEXT NOT NULL DEFAULT '',
+    total INTEGER
+)
+"""
+
+
 def connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(DB_PATH)
+    connection = sqlite3.connect(DB_PATH, timeout=30)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA busy_timeout=30000")
     connection.execute(_SCHEMA)
+    connection.execute(_JOB_SCHEMA)
+    connection.execute(
+        "INSERT INTO refresh_job (id, state, message, total) VALUES (1, 'idle', '', NULL) "
+        "ON CONFLICT(id) DO NOTHING"
+    )
     return connection
 
 
@@ -188,6 +205,26 @@ def save_fetched_paper(original_url: str, paper: dict[str, str]) -> None:
             ),
         )
         connection.commit()
+
+
+def get_refresh_job() -> dict[str, object]:
+    with connect() as connection:
+        row = connection.execute("SELECT state, message, total FROM refresh_job WHERE id = 1").fetchone()
+    return {"state": row["state"], "message": row["message"], "total": row["total"]}
+
+
+def set_refresh_job(state: str, message: str = "", total: int | None = None) -> None:
+    with connect() as connection:
+        connection.execute(
+            "UPDATE refresh_job SET state = ?, message = ?, total = ? WHERE id = 1",
+            (state, message, total),
+        )
+        connection.commit()
+
+
+def mark_refresh_interrupted() -> None:
+    if get_refresh_job()["state"] == "running":
+        set_refresh_job("error", "读取中断，请再试一次")
 
 
 def list_papers(offset: int) -> list[sqlite3.Row]:

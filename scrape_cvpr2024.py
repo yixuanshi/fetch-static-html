@@ -13,6 +13,7 @@ import re
 import threading
 import time
 import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import quote, urljoin
@@ -191,6 +192,141 @@ def parse_listing(html: str) -> list[dict[str, str]]:
             }
         )
     return papers
+
+
+class _ListingParser(HTMLParser):
+    """Stream the CVF listing without building a document tree.
+
+    The full listing is large enough to exhaust the 256 MB deployment
+    instance when parsed with BeautifulSoup.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.papers: list[dict[str, str]] = []
+        self.mode: str | None = None
+        self.current: dict[str, str] | None = None
+        self.authors: list[str] = []
+        self.buf: list[str] = []
+        self.in_title = False
+        self.link_href = ""
+        self.capture_link = False
+        self.bib_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr = {key: value or "" for key, value in attrs}
+        classes = attr.get("class", "").split()
+        if tag == "dt" and "ptitle" in classes:
+            self.mode = "title"
+            self.authors = []
+            self.current = {
+                "title": "",
+                "authors": "",
+                "abstract": "",
+                "abstract_source": "",
+                "paper_url": "",
+                "listing_url": "",
+                "pdf_url": "",
+                "supp_url": "",
+                "arxiv_url": "",
+                "pages": "",
+            }
+            return
+        if self.mode == "title" and tag == "a" and attr.get("href"):
+            paper_url = urljoin(BASE, attr["href"])
+            assert self.current is not None
+            self.current["paper_url"] = paper_url
+            self.current["listing_url"] = paper_url
+            self.in_title = True
+            self.buf = []
+            return
+        if tag == "dd" and self.mode == "after_title":
+            self.mode = "authors"
+            return
+        if tag == "dd" and self.mode == "after_authors":
+            self.mode = "links"
+            return
+        if self.mode == "authors" and tag == "input" and attr.get("name") == "query_author" and attr.get("value"):
+            self.authors.append(clean_text(attr["value"]))
+            return
+        if self.mode == "links" and self.bib_depth == 0 and tag == "a" and attr.get("href"):
+            self.link_href = urljoin(BASE, attr["href"])
+            self.capture_link = True
+            self.buf = []
+            return
+        if self.mode == "links" and tag == "div" and "bibref" in classes:
+            self.bib_depth = 1
+            self.buf = []
+            return
+        if self.bib_depth and tag == "div":
+            self.bib_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self.in_title and self.current is not None:
+            self.current["title"] = clean_text("".join(self.buf))
+            self.in_title = False
+            return
+        if tag == "dt" and self.mode == "title":
+            self.mode = "after_title"
+            return
+        if tag == "a" and self.capture_link and self.current is not None:
+            label = "".join(self.buf).strip()
+            if label == "pdf":
+                self.current["pdf_url"] = self.link_href
+            elif label == "supp":
+                self.current["supp_url"] = self.link_href
+            elif label.lower() == "arxiv":
+                self.current["arxiv_url"] = self.link_href
+            self.capture_link = False
+            return
+        if tag == "div" and self.bib_depth:
+            self.bib_depth -= 1
+            if self.bib_depth == 0 and self.current is not None:
+                match = PAGES_RE.search(" ".join("".join(self.buf).split()))
+                if match:
+                    self.current["pages"] = clean_text(match.group(1))
+            return
+        if tag == "dd" and self.mode == "authors":
+            self.mode = "after_authors"
+            return
+        if tag == "dd" and self.mode == "links" and self.current is not None:
+            self.current["authors"] = ", ".join(self.authors)
+            if self.current["title"] and self.current["paper_url"]:
+                self.papers.append(self.current)
+            self.current = None
+            self.mode = None
+
+    def handle_data(self, data: str) -> None:
+        if self.in_title or self.capture_link or self.bib_depth:
+            self.buf.append(data)
+
+
+def stream_listing(session: requests.Session) -> list[dict[str, str]]:
+    last_error: Exception | None = None
+    for attempt in range(3):
+        parser = _ListingParser()
+        response = None
+        rate_limit()
+        try:
+            response = session.get(LIST_URL, timeout=30, stream=True)
+            if response.status_code in {429, 500, 502, 503, 504}:
+                last_error = requests.HTTPError(f"{response.status_code} for {LIST_URL}")
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            response.raise_for_status()
+            response.encoding = "utf-8"
+            for chunk in response.iter_content(chunk_size=65536, decode_unicode=True):
+                if chunk:
+                    parser.feed(chunk)
+            parser.close()
+            return parser.papers
+        except requests.RequestException as exc:
+            last_error = exc
+            time.sleep(1.5 * (attempt + 1))
+        finally:
+            if response is not None:
+                response.close()
+    raise RuntimeError(f"failed to fetch {LIST_URL}: {last_error}")
 
 
 def parse_abstract(html: str) -> str:

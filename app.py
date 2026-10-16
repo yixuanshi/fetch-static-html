@@ -4,23 +4,49 @@ from __future__ import annotations
 
 import html
 import os
+import threading
 from contextlib import asynccontextmanager
-from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse
 
 import paper_db
-from scrape_cvpr2024 import LIST_URL, complete_paper, fetch_text, make_session, parse_listing
+from scrape_cvpr2024 import LIST_URL, complete_paper, make_session, stream_listing
 
 ROOT = paper_db.ROOT
 XLSX = paper_db.XLSX_PATH
 XLSX_MEDIA = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
+_refresh_guard = threading.Lock()
+
+
+def _refresh_worker() -> None:
+    try:
+        papers = stream_listing(make_session())
+        if not papers:
+            paper_db.set_refresh_job("error", "网站没有返回论文")
+            return
+        total = paper_db.upsert_papers(papers, keep_existing_abstract=True)
+        del papers
+        missing = paper_db.papers_missing_abstract()
+        if len(missing) <= 8:
+            for paper in missing:
+                original_url = paper["paper_url"]
+                try:
+                    complete_paper(paper)
+                except Exception:
+                    continue
+                paper_db.save_fetched_paper(original_url, paper)
+        paper_db.set_refresh_job("done", "已读完", total)
+    except Exception as exc:
+        paper_db.set_refresh_job("error", str(exc)[:180] or "读取失败")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     paper_db.seed_from_xlsx_if_empty()
+    paper_db.mark_refresh_interrupted()
     yield
 
 
@@ -37,30 +63,24 @@ def health() -> dict[str, object]:
 
 
 @app.post("/refresh")
-def refresh_papers() -> RedirectResponse:
-    try:
-        papers = parse_listing(fetch_text(LIST_URL, make_session()))
-    except Exception as exc:
-        return RedirectResponse(f"/?error={quote(str(exc)[:180])}", status_code=303)
-    if not papers:
-        return RedirectResponse("/?error=" + quote("网站没有返回论文"), status_code=303)
-    total = paper_db.upsert_papers(papers, keep_existing_abstract=True)
-    missing = paper_db.papers_missing_abstract()
-    # The listing page has no abstracts. Fill only the rows still empty so a
-    # refresh stays fast when the database already holds the program.
-    if len(missing) <= 40:
-        for paper in missing:
-            original_url = paper["paper_url"]
-            try:
-                complete_paper(paper)
-            except Exception:
-                continue
-            paper_db.save_fetched_paper(original_url, paper)
-    return RedirectResponse(f"/?updated={total}", status_code=303)
+def refresh_papers() -> dict[str, object]:
+    with _refresh_guard:
+        job = paper_db.get_refresh_job()
+        if job["state"] == "running":
+            return job
+        paper_db.set_refresh_job("running", "正在读取。。。")
+        threading.Thread(target=_refresh_worker, daemon=True).start()
+    return {"state": "running", "message": "正在读取。。。", "total": None}
+
+
+@app.get("/refresh-status")
+def refresh_status() -> dict[str, object]:
+    return paper_db.get_refresh_job()
 
 
 @app.get("/", response_class=HTMLResponse)
 def index(offset: int = 0, updated: int | None = None, error: str = "") -> str:
+    reading = paper_db.get_refresh_job()["state"] == "running"
     total = paper_db.count_papers()
     page_size = paper_db.PAGE_SIZE
     max_offset = ((total - 1) // page_size) * page_size if total else 0
@@ -135,7 +155,7 @@ def index(offset: int = 0, updated: int | None = None, error: str = "") -> str:
   <h1>CVPR 2024 论文</h1>
   <p class="count">论文总数：{total}</p>
   <p>当前显示第 {start}–{end} 篇。来源：<a href="{html.escape(LIST_URL, quote=True)}">CVPR 2024 Open Access</a></p>
-  <p id="read-status" class="notice" hidden>正在读取。。。</p>
+  <p id="read-status" class="notice"{" hidden" if not reading else ""}>正在读取。。。</p>
   {notice_html}
   <form id="read-form" method="post" action="/refresh">
     <button id="read-button" type="submit">读取论文</button>
@@ -146,12 +166,55 @@ def index(offset: int = 0, updated: int | None = None, error: str = "") -> str:
   </form>
   {table}
   <script>
-    document.getElementById("read-form").addEventListener("submit", function () {{
-      const status = document.getElementById("read-status");
-      status.hidden = false;
-      status.textContent = "正在读取。。。";
-      document.getElementById("read-button").disabled = true;
+    const readStatus = document.getElementById("read-status");
+    const readButton = document.getElementById("read-button");
+
+    async function watchRead() {{
+      readStatus.hidden = false;
+      readStatus.textContent = "正在读取。。。";
+      readButton.disabled = true;
+      let misses = 0;
+      for (let tick = 0; tick < 180; tick += 1) {{
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        try {{
+          const response = await fetch("/refresh-status");
+          if (!response.ok) throw new Error("status");
+          const body = await response.json();
+          misses = 0;
+          if (body.state === "done") {{
+            window.location = "/?updated=" + encodeURIComponent(body.total ?? "");
+            return;
+          }}
+          if (body.state === "error") {{
+            readStatus.textContent = body.message || "读取失败";
+            readButton.disabled = false;
+            return;
+          }}
+        }} catch (err) {{
+          misses += 1;
+          if (misses >= 15) break;
+        }}
+      }}
+      readStatus.textContent = "读取中断，请再试一次";
+      readButton.disabled = false;
+    }}
+
+    document.getElementById("read-form").addEventListener("submit", async function (event) {{
+      event.preventDefault();
+      readStatus.hidden = false;
+      readStatus.textContent = "正在读取。。。";
+      readButton.disabled = true;
+      try {{
+        const response = await fetch("/refresh", {{method: "POST"}});
+        if (!response.ok) throw new Error("start");
+      }} catch (err) {{
+        readStatus.textContent = "读取失败";
+        readButton.disabled = false;
+        return;
+      }}
+      watchRead();
     }});
+    {"watchRead();" if reading else ""}
   </script>
 </body>
 </html>
