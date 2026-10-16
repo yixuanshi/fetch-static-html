@@ -1,0 +1,7 @@
+{
+  "service_name": "fetch-static-html",
+  "branch": "main",
+  "port": 8000,
+  "repo_url": "https://github.com/yixuanshi/fetch-static-html",
+  "env_vars": {}
+}
