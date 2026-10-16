@@ -3,4 +3,5 @@ __pycache__/
 *.pyc
 .DS_Store
 .env
+data/
 repo/.cvpr2024_checkpoint.jsonl
